@@ -93,7 +93,7 @@ def main() -> None:
     username = identity.get("username", os.environ["SF_USERNAME"])
     print(f"✓  Org: {org_name}  |  User: {username}")
 
-    result = sf.query("SELECT COUNT() FROM Lead")
+    result = sf.query("SELECT COUNT() FROM Lead  ") 
     lead_count = result["totalSize"]
     print(f"✓  Lead count: {lead_count}")
 
