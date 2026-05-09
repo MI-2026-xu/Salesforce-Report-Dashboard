@@ -87,11 +87,13 @@ def get_schema(object_name: str) -> dict[str, Any]:
     sf = _connect()
 
     try:
-        sf_object = getattr(sf, object_name)
-        describe = sf_object.describe()
-    except AttributeError:
-        raise ValueError(f"Salesforce object '{object_name}' not found.")
+        # Use sf.restful() instead of getattr(sf, name).describe() — the SFType
+        # attribute path builds URLs incorrectly with session-based OAuth auth.
+        describe = sf.restful(f"sobjects/{object_name}/describe/")
     except Exception as exc:
+        msg = str(exc)
+        if "NOT_FOUND" in msg or "not found" in msg.lower() or "404" in msg:
+            raise ValueError(f"Salesforce object '{object_name}' not found.")
         raise ValueError(f"Could not describe '{object_name}': {exc}")
 
     schema = {
