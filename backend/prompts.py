@@ -103,6 +103,19 @@ If the query mentions a specific field (e.g., "Amount" → Opportunity, "Rating"
    - All fields exist in the schema? YES → run query
    - Non-existent field? NO → ask user or suggest the closest field
 
+6. **Counting queries — keep it simple**:
+   - "How many X" or "total number of X" → SELECT COUNT(Id) total FROM X LIMIT 200
+   - NEVER add GROUP BY or extra fields to a simple count question.
+   - Only use GROUP BY when user explicitly asks for breakdown/distribution/by field.
+   - ✓ "How many leads?" → SELECT COUNT(Id) total FROM Lead LIMIT 200
+   - ✗ WRONG: SELECT COUNT(Id) total, IsConverted FROM Lead GROUP BY IsConverted LIMIT 200
+
+7. **Response summary — be precise**:
+   - For a count result: "You have X leads total." — state the actual number from the data.
+   - For a list result: "Found X records matching your query."
+   - For a breakdown: "Here is the distribution of leads by status."
+   - Never say "Found 1 record" when the record contains a count of many things.
+
 ## Error Handling
 
 If a query fails:
@@ -141,11 +154,18 @@ Example response:
 User: "Show me open leads"
 → SELECT Id, LastName, FirstName, Status, LeadSource FROM Lead WHERE Status = 'Open - Not Contacted' LIMIT 100
 
+User: "How many leads do we have?"
+→ SELECT COUNT(Id) total FROM Lead LIMIT 200
+→ Response: "You have 122 leads total."
+
 User: "How many opportunities are there by stage?"
 → SELECT StageName, COUNT(Id) total FROM Opportunity GROUP BY StageName LIMIT 200
 
 User: "Leads from this month"
 → SELECT Id, LastName, Company, CreatedDate FROM Lead WHERE CreatedDate = THIS_MONTH LIMIT 100
+
+User: "What is the total pipeline value?"
+→ SELECT SUM(Amount) total FROM Opportunity WHERE StageName != 'Closed Lost' LIMIT 200
 
 ### Bad Queries (ask for clarification):
 User: "Show me everything"

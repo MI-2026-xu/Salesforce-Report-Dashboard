@@ -8,7 +8,11 @@ All logic is Python-side — no extra LLM call needed.
 chartType is determined by the shape of the data, not by guessing.
 """
 
+import re
 from typing import Any
+
+# Field names that indicate a COUNT/SUM aggregate result
+_AGGREGATE_FIELD_NAMES = {"total", "count", "cnt", "num", "n", "sum", "avg", "average", "max", "min"}
 
 
 # ── Chart type detection ───────────────────────────────────────────────────────
@@ -89,20 +93,42 @@ def _generate_summary(
     total_size: int,
     user_query: str,
     claude_text: str,
+    soql: str | None = None,
 ) -> str:
     """
     Build a one-sentence summary.
     Prefers Claude's text if it's short; falls back to a generated sentence.
+    Handles aggregate single-row results naturally (e.g. COUNT → "You have 122 leads total.").
     """
     if not records:
         return "No records found matching your query."
 
-    # If Claude's text is concise (≤ 2 sentences), use it directly
+    # ── Aggregate single-row detection ────────────────────────────────────────
+    # e.g. SELECT COUNT(Id) total FROM Lead → [{total: 122}]
+    # Give a natural "You have N X total." sentence instead of "Found 1 record."
+    if len(records) == 1:
+        fields = list(records[0].keys())
+        agg_fields = [f for f in fields if f.lower() in _AGGREGATE_FIELD_NAMES]
+        if agg_fields and len(fields) <= 2:
+            val = records[0][agg_fields[0]]
+            if isinstance(val, (int, float)):
+                # Try to extract object name from SOQL for natural phrasing
+                obj_label = ""
+                if soql:
+                    m = re.search(r"\bFROM\s+(\w+)", soql, re.IGNORECASE)
+                    if m:
+                        obj_label = f" {m.group(1).lower()}s"
+                # Currency / sum values
+                if agg_fields[0].lower() in {"sum", "total"} and val > 1000:
+                    return f"Total{obj_label}: ${val:,.0f}."
+                return f"You have {int(val):,}{obj_label} in total."
+
+    # ── Claude's text is concise (≤ 2 sentences) — use it directly ───────────
     sentences = [s.strip() for s in claude_text.split(".") if s.strip()]
     if 1 <= len(sentences) <= 2:
         return claude_text.strip()
 
-    # Otherwise, build a summary from the record count
+    # ── Fallback: record count sentence ──────────────────────────────────────
     count_str = f"{total_size:,}" if total_size > len(records) else str(len(records))
     return f"Found {count_str} record{'s' if total_size != 1 else ''}."
 
@@ -133,7 +159,7 @@ def synthesize(
     """
     chart_type = _detect_chart_type(records)
     insight    = _generate_insight(records, chart_type)
-    summary    = _generate_summary(records, total_size, user_query, claude_text)
+    summary    = _generate_summary(records, total_size, user_query, claude_text, soql)
 
     return {
         "summary":    summary,
