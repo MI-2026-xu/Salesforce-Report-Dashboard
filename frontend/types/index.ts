@@ -1,4 +1,26 @@
-// ── API Types ────────────────────────────────────────────────────────────────
+// ── Auth Types ────────────────────────────────────────────────────────────────
+
+export interface User {
+  id: string;
+  email: string;
+  name: string | null;
+  created_at: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: User;
+}
+
+export interface SFStatus {
+  connected: boolean;
+  instance_url?: string;
+  sf_username?: string;
+  org_id?: string;
+  connected_at?: string;
+}
+
+// ── API Types ─────────────────────────────────────────────────────────────────
 
 export interface QueryRequest {
   query: string;
@@ -32,7 +54,7 @@ export interface HealthResponse {
   version: string;
 }
 
-// ── Chat Types ───────────────────────────────────────────────────────────────
+// ── Chat Types ────────────────────────────────────────────────────────────────
 
 export type MessageRole = "user" | "assistant" | "error";
 
@@ -40,6 +62,6 @@ export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
-  data?: QueryResponse;   // present on assistant messages that have data
+  data?: QueryResponse;
   timestamp: Date;
 }

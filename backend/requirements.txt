@@ -5,3 +5,10 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pytest==8.3.4
 httpx==0.28.1
+
+# Multi-user auth + PostgreSQL
+psycopg2-binary==2.9.12
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+cryptography==47.0.0

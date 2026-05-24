@@ -1,14 +1,8 @@
 """
-Layer 3 — Claude AI agent.
+agent.py — Claude AI agent (multi-user, per-request Salesforce connection).
 
-Receives a plain-English query, runs the agentic tool-use loop with Claude,
-dispatches tool calls to sf_connector, and returns a structured response.
-
-Days 8–11 complete:
-  Day 8  — core agentic loop + tool dispatcher
-  Day 9  — intent parser + full system prompt
-  Day 10 — schema injection before first message
-  Day 11 — SOQL validator + max-2 retry logic   ← current
+run_agent(user_query, sf, conversation_history) accepts an already-authenticated
+Salesforce instance so each user queries their own org.
 """
 
 import json
@@ -18,6 +12,7 @@ from typing import Any
 
 import anthropic
 from dotenv import load_dotenv
+from simple_salesforce import Salesforce
 
 from prompts import SYSTEM_PROMPT, validate_intent
 from sf_connector import get_available_objects, get_schema, run_soql
@@ -29,24 +24,20 @@ load_dotenv(Path(__file__).parent / ".env")
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
-MAX_TOOL_ROUNDS = 10   # hard ceiling on total Claude ↔ tool round-trips
-MAX_SOQL_RETRIES = 2   # how many times Claude gets to fix a bad SOQL query
+MAX_TOOL_ROUNDS = 10
+MAX_SOQL_RETRIES = 2
 
 
 # ── Tool dispatcher ────────────────────────────────────────────────────────────
 
-def _dispatch(tool_name: str, tool_input: dict, soql_retry_count: list[int]) -> Any:
-    """
-    Route a Claude tool call to the correct sf_connector function.
+def _dispatch(tool_name: str, tool_input: dict, soql_retry_count: list[int], sf: Salesforce) -> Any:
+    """Route a Claude tool call to the correct sf_connector function."""
 
-    soql_retry_count is a mutable 1-element list used as a shared counter
-    so the caller can track retries without global state.
-    """
     if tool_name == "get_available_objects":
-        return get_available_objects()
+        return get_available_objects(sf)
 
     if tool_name == "get_schema":
-        return get_schema(tool_input["object_name"])
+        return get_schema(tool_input["object_name"], sf)
 
     if tool_name == "run_soql":
         query = tool_input["query"]
@@ -54,7 +45,6 @@ def _dispatch(tool_name: str, tool_input: dict, soql_retry_count: list[int]) -> 
 
         if not validation["valid"]:
             soql_retry_count[0] += 1
-
             if soql_retry_count[0] > MAX_SOQL_RETRIES:
                 return {
                     "error": "max_retries_exceeded",
@@ -65,8 +55,6 @@ def _dispatch(tool_name: str, tool_input: dict, soql_retry_count: list[int]) -> 
                     ),
                     "last_errors": validation["errors"],
                 }
-
-            # Return error with correction instruction so Claude self-corrects
             return {
                 "error": "invalid_soql",
                 "attempt": soql_retry_count[0],
@@ -79,40 +67,43 @@ def _dispatch(tool_name: str, tool_input: dict, soql_retry_count: list[int]) -> 
                 ),
             }
 
-        # Validation passed — hit Salesforce
-        soql_retry_count[0] = 0  # reset counter on success
-        return run_soql(query)
+        soql_retry_count[0] = 0
+        return run_soql(query, sf)
 
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
 # ── Agent loop ─────────────────────────────────────────────────────────────────
 
-def run_agent(user_query: str, conversation_history: list | None = None) -> dict[str, Any]:
+def run_agent(
+    user_query: str,
+    sf: Salesforce,
+    conversation_history: list | None = None,
+) -> dict[str, Any]:
     """
     Run the Claude agentic loop for a single user query.
 
     Args:
         user_query:           Plain-English question about Salesforce data.
+        sf:                   Authenticated Salesforce instance for this user.
         conversation_history: Optional prior messages for multi-turn context.
 
     Returns:
         {
           "response":   str,
           "tool_calls": list,
-          "soql":       str | None   — last successful SOQL query (for debug panel),
+          "soql":       str | None,
           "error":      str | None,
+          ... (synthesizer fields)
         }
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    # ── Schema injection ───────────────────────────────────────────────────────
-    # If intent is clear, pre-fetch schema and inject the exact field list so
-    # Claude never hallucinates field names.
+    # Schema injection — pre-fetch schema when intent is clear
     intent = validate_intent(user_query)
     if intent["valid"] and intent["object"]:
         try:
-            schema = get_schema(intent["object"])
+            schema = get_schema(intent["object"], sf)
             first_message = inject_schema_context(user_query, schema)
         except Exception:
             first_message = user_query
@@ -123,7 +114,7 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
     messages.append({"role": "user", "content": first_message})
 
     tool_call_log: list[dict] = []
-    soql_retry_count = [0]   # mutable counter passed into _dispatch
+    soql_retry_count = [0]
     last_soql: str | None = None
     last_records: list[dict] = []
     last_total_size: int = 0
@@ -139,7 +130,6 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
 
         messages.append({"role": "assistant", "content": response.content})
 
-        # ── End turn ───────────────────────────────────────────────────────
         if response.stop_reason == "end_turn":
             final_text = " ".join(
                 block.text for block in response.content
@@ -153,7 +143,6 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
                 soql=last_soql,
             ) | {"tool_calls": tool_call_log, "error": None}
 
-        # ── Tool use ───────────────────────────────────────────────────────
         if response.stop_reason == "tool_use":
             tool_results = []
 
@@ -164,10 +153,9 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
                 tool_log = {"tool": block.name, "input": block.input}
 
                 try:
-                    result = _dispatch(block.name, block.input, soql_retry_count)
+                    result = _dispatch(block.name, block.input, soql_retry_count, sf)
                     tool_log["status"] = "ok"
 
-                    # Capture records + SOQL for synthesizer
                     if block.name == "run_soql" and isinstance(result, dict) and "records" in result:
                         last_soql = block.input.get("query")
                         last_records = result["records"]
@@ -194,7 +182,6 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
                     tool_log["result_summary"] = str(result)[:120]
 
                 tool_call_log.append(tool_log)
-
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -212,34 +199,3 @@ def run_agent(user_query: str, conversation_history: list | None = None) -> dict
         "soql": last_soql,
         "error": "max_rounds_exceeded",
     }
-
-
-# ── Manual test ────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    test_queries = [
-        "How many leads do we have in total?",
-        "Show me the top 5 leads by name",
-    ]
-
-    for query in test_queries:
-        print(f"\n{'=' * 60}")
-        print(f"Query: {query}")
-        print("=" * 60)
-
-        result = run_agent(query)
-
-        print("\nTool calls made:")
-        for i, call in enumerate(result["tool_calls"], 1):
-            status = call.get("status", "")
-            print(f"  {i}. [{status}] {call['tool']}() → {call['result_summary']}")
-
-        if result.get("soql"):
-            print(f"\nSOQL executed: {result['soql']}")
-
-        print(f"\nAgent's response:\n  {result['response']}")
-
-        if result["error"]:
-            print(f"\n  ✗ Error: {result['error']}")
-        else:
-            print(f"\n  ✓ Done in {len(result['tool_calls'])} tool call(s)")
