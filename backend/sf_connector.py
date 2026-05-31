@@ -12,8 +12,8 @@ Schema / objects results are cached per instance_url for 1 hour so repeated
 calls within a session stay fast without hitting the Salesforce API.
 """
 
+import json
 import os
-import time
 from pathlib import Path
 from typing import Any
 
@@ -21,14 +21,11 @@ import requests
 from dotenv import load_dotenv
 from simple_salesforce import Salesforce
 
+from redis_client import get_redis
+
 load_dotenv(Path(__file__).parent / ".env")
 
-_SCHEMA_TTL = 3600  # seconds — invalidate schema cache after 1 hour
-
-# ── Per-org caches (keyed by instance_url) ────────────────────────────────────
-# Avoids re-fetching the same schema for every user on the same org.
-_schema_cache: dict[str, dict[str, tuple[dict, float]]] = {}
-_objects_cache: dict[str, tuple[list[str], float]] = {}
+_SCHEMA_TTL = 3600  # seconds — Redis key TTL for schema / object-list cache
 
 
 # ── Connection factory ─────────────────────────────────────────────────────────
@@ -69,13 +66,13 @@ def refresh_access_token(refresh_token: str, instance_url: str) -> str:
     return resp.json()["access_token"]
 
 
-# ── get_schema (per-org cache, 1 hr TTL) ──────────────────────────────────────
+# ── get_schema (Redis cache, 1 hr TTL) ────────────────────────────────────────
 
 def get_schema(object_name: str, sf: Salesforce) -> dict[str, Any]:
     """
     Return the field schema for a Salesforce object.
 
-    Results are cached per org (instance_url) for 1 hour.
+    Results are cached in Redis per org for 1 hour, shared across all pods.
 
     Returns:
         {
@@ -90,12 +87,12 @@ def get_schema(object_name: str, sf: Salesforce) -> dict[str, Any]:
         ValueError      if the object doesn't exist or isn't accessible
         ConnectionError if the token is expired (caller should refresh)
     """
-    org_key = sf.base_url
-    org_schemas = _schema_cache.setdefault(org_key, {})
+    r = get_redis()
+    redis_key = f"sf:schema:{sf.base_url}:{object_name}"
 
-    cached, ts = org_schemas.get(object_name, (None, 0.0))
-    if cached is not None and (time.time() - ts) < _SCHEMA_TTL:
-        return {**cached, "cached": True}
+    raw = r.get(redis_key)
+    if raw:
+        return {**json.loads(raw), "cached": True}
 
     try:
         describe = sf.restful(f"sobjects/{object_name}/describe/")
@@ -113,8 +110,19 @@ def get_schema(object_name: str, sf: Salesforce) -> dict[str, Any]:
         "cached":    False,
     }
 
-    org_schemas[object_name] = (schema, time.time())
+    r.set(redis_key, json.dumps(schema), ex=_SCHEMA_TTL)
     return schema
+
+
+def flush_schema(object_name: str, instance_url: str) -> int:
+    """Delete all cached schema keys for a given object across all orgs (or one org).
+    Returns the number of keys deleted."""
+    r = get_redis()
+    pattern = f"sf:schema:*{instance_url}*:{object_name}" if instance_url else f"sf:schema:*:{object_name}"
+    keys = r.keys(pattern)
+    if keys:
+        return r.delete(*keys)
+    return 0
 
 
 # ── run_soql ───────────────────────────────────────────────────────────────────
@@ -156,17 +164,17 @@ def run_soql(query: str, sf: Salesforce) -> dict[str, Any]:
 def get_available_objects(sf: Salesforce) -> list[str]:
     """
     Return sorted list of all queryable Salesforce object names in this org.
-    Cached per org for 1 hour.
+    Cached in Redis per org for 1 hour.
 
     Raises:
         ConnectionError if the token is expired
     """
-    org_key = sf.base_url
-    cached = _objects_cache.get(org_key)
-    if cached is not None:
-        objects, ts = cached
-        if (time.time() - ts) < _SCHEMA_TTL:
-            return objects
+    r = get_redis()
+    redis_key = f"sf:objects:{sf.base_url}"
+
+    raw = r.get(redis_key)
+    if raw:
+        return json.loads(raw)
 
     try:
         describe = sf.describe()
@@ -179,5 +187,5 @@ def get_available_objects(sf: Salesforce) -> list[str]:
         if obj.get("queryable", False)
     )
 
-    _objects_cache[org_key] = (objects, time.time())
+    r.set(redis_key, json.dumps(objects), ex=_SCHEMA_TTL)
     return objects

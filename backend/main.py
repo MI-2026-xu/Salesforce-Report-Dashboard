@@ -16,11 +16,15 @@ Protected routes (Bearer JWT required):
   GET  /api/objects         — object list from user's org
   DELETE /api/session/{id}  — clear conversation history
 
-Run:
+Run locally:
   uvicorn main:app --reload --port 8000
+
+Production (Railway reads PORT automatically via Procfile):
+  web: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -47,16 +51,16 @@ from auth import (
 )
 from crypto import decrypt, encrypt
 from database import (
+    append_message,
     create_user,
     delete_session,
     delete_sf_connection,
+    get_session_messages,
     get_sf_connection,
-    get_session_history,
     get_user_by_email,
     get_user_by_id,
     init_db,
     update_sf_access_token,
-    upsert_session_history,
     upsert_sf_connection,
 )
 from sf_connector import (
@@ -75,12 +79,15 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# ALLOWED_ORIGINS accepts a comma-separated list so both local and production
+# URLs can be whitelisted from a single env var.
+# Example: ALLOWED_ORIGINS=https://your-app.vercel.app,http://localhost:3000
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("CORS_ORIGIN", "http://localhost:3000"),
-        os.getenv("FRONTEND_URL", "http://localhost:3000"),
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -133,9 +140,13 @@ def get_sf_for_user(user: dict = Depends(get_current_user)) -> Salesforce:
     """
     FastAPI dependency — loads the user's Salesforce connection from DB,
     decrypts the tokens, and returns a live Salesforce client.
-    Auto-refreshes the access token if it has expired.
-    Raises HTTP 403 if no Salesforce account is connected yet.
+
+    Token refresh is protected by a 30-second Redis lock so that two
+    simultaneous requests for the same user never both call Salesforce's
+    refresh endpoint (which would invalidate the first token).
     """
+    from redis_client import get_redis
+
     conn = get_sf_connection(user["id"])
     if not conn:
         raise HTTPException(
@@ -153,15 +164,28 @@ def get_sf_for_user(user: dict = Depends(get_current_user)) -> Salesforce:
     try:
         sf.restful("sobjects/")
     except Exception:
-        try:
-            new_access = refresh_access_token(refresh_token, instance_url)
-            update_sf_access_token(user["id"], encrypt(new_access))
-            sf = connect_with_tokens(new_access, instance_url)
-        except ConnectionError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Salesforce session expired and could not be refreshed: {exc}",
-            )
+        r = get_redis()
+        lock_key = f"sf:refresh-lock:{user['id']}"
+
+        got_lock = r.set(lock_key, "1", nx=True, ex=30)
+        if got_lock:
+            try:
+                new_access = refresh_access_token(refresh_token, instance_url)
+                update_sf_access_token(user["id"], encrypt(new_access))
+                sf = connect_with_tokens(new_access, instance_url)
+            except ConnectionError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Salesforce session expired and could not be refreshed: {exc}",
+                )
+            finally:
+                r.delete(lock_key)
+        else:
+            # Another request is mid-refresh — wait for it, then read the new token
+            time.sleep(1)
+            fresh = get_sf_connection(user["id"])
+            if fresh:
+                sf = connect_with_tokens(decrypt(fresh["access_token_enc"]), instance_url)
 
     return sf
 
@@ -202,11 +226,6 @@ class QueryResponse(BaseModel):
     tool_calls: list[dict]
     error: str | None
 
-
-class HealthResponse(BaseModel):
-    status: str
-    salesforce: str
-    version: str
 
 
 # ── Auth routes ────────────────────────────────────────────────────────────────
@@ -480,17 +499,16 @@ async def query(
 ) -> QueryResponse:
     """Run the AI agent against the user's Salesforce org."""
     session_id = req.session_id or str(uuid.uuid4())
-    history    = get_session_history(current_user["id"], session_id)
+    history    = get_session_messages(current_user["id"], session_id)
 
     try:
         result = run_agent(req.query, sf=sf, conversation_history=history)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    # Persist updated history to DB
-    history.append({"role": "user",      "content": req.query})
-    history.append({"role": "assistant", "content": result.get("response", "")})
-    upsert_session_history(current_user["id"], session_id, history)
+    # Persist — two appends can never overwrite each other (no lost updates)
+    append_message(current_user["id"], session_id, "user",      req.query)
+    append_message(current_user["id"], session_id, "assistant", result.get("response", ""))
 
     return QueryResponse(
         session_id=session_id,
@@ -509,23 +527,23 @@ async def query(
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
-@app.get("/api/health", response_model=HealthResponse)
-async def health(
+@app.get("/api/health")
+async def health() -> dict:
+    """Lightweight health check — no auth, no SF call. For load balancers. <50 ms."""
+    return {"status": "ok", "version": app.version}
+
+
+@app.get("/api/health/deep")
+async def health_deep(
     current_user: dict = Depends(get_current_user),
     sf: Salesforce = Depends(get_sf_for_user),
-) -> HealthResponse:
-    """Returns server + Salesforce connection status for the current user."""
+) -> dict:
+    """Full health check — verifies SF connectivity. For monitoring dashboards."""
     try:
         sf.restful("sobjects/")
-        sf_status_str = "connected"
+        return {"status": "ok", "salesforce": "connected", "version": app.version}
     except Exception as exc:
-        sf_status_str = f"error: {exc}"
-
-    return HealthResponse(
-        status="ok" if sf_status_str == "connected" else "degraded",
-        salesforce=sf_status_str,
-        version=app.version,
-    )
+        return {"status": "degraded", "salesforce": f"error: {exc}", "version": app.version}
 
 
 @app.get("/api/objects")

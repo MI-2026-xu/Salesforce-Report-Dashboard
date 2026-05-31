@@ -1,34 +1,35 @@
-# Environment variables — never commit credentials
+# ── Secrets — never commit ────────────────────────────────────────────────────
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
 .venv/
 venv/
+env/
 *.egg-info/
 dist/
 build/
 .pytest_cache/
 
-# Node
+# ── Node ──────────────────────────────────────────────────────────────────────
 node_modules/
 .next/
 out/
 *.tsbuildinfo
 .vercel
 
-# OS
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/settings.json
 .idea/
 
-# Logs
+# ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 uvicorn.log

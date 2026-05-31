@@ -27,15 +27,23 @@ _pool: psycopg2.pool.SimpleConnectionPool | None = None
 def _get_pool() -> psycopg2.pool.SimpleConnectionPool:
     global _pool
     if _pool is None:
-        _pool = psycopg2.pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=20,
-            host=os.environ["DB_HOST"],
-            port=int(os.environ.get("DB_PORT", "5432")),
-            dbname=os.environ["DB_NAME"],
-            user=os.environ["DB_USER"],
-            password=os.environ["DB_PASSWORD"],
-        )
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url:
+            # Railway / Heroku provide a single connection string
+            _pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1, maxconn=20, dsn=database_url
+            )
+        else:
+            # Local dev: individual vars
+            _pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=20,
+                host=os.environ["DB_HOST"],
+                port=int(os.environ.get("DB_PORT", "5432")),
+                dbname=os.environ["DB_NAME"],
+                user=os.environ["DB_USER"],
+                password=os.environ["DB_PASSWORD"],
+            )
     return _pool
 
 
@@ -94,6 +102,17 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Append-only message store (Stage 2) — one row per message, no lost updates
+CREATE TABLE IF NOT EXISTS messages (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id  VARCHAR(255) NOT NULL,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role        VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS messages_session_created ON messages (session_id, created_at);
 """
 
 
@@ -280,3 +299,44 @@ def delete_session(user_id: str, session_id: str) -> None:
                 "DELETE FROM conversation_sessions WHERE session_id = %s AND user_id = %s",
                 (session_id, user_id),
             )
+            cur.execute(
+                "DELETE FROM messages WHERE session_id = %s AND user_id = %s",
+                (session_id, user_id),
+            )
+
+
+# ── Append-only message helpers (Stage 2) ─────────────────────────────────────
+
+def append_message(user_id: str, session_id: str, role: str, content: str) -> None:
+    """Insert a single message row. Never overwrites — two concurrent calls both succeed."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (session_id, user_id, role, content) VALUES (%s, %s, %s, %s)",
+                (session_id, user_id, role, content),
+            )
+
+
+def get_session_messages(
+    user_id: str,
+    session_id: str,
+    limit: int = MAX_HISTORY_TURNS * 2,
+) -> list[dict]:
+    """Return the last `limit` messages for a session, oldest first."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content FROM (
+                    SELECT role, content, created_at
+                    FROM messages
+                    WHERE session_id = %s AND user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                ) sub
+                ORDER BY created_at
+                """,
+                (session_id, user_id, limit),
+            )
+            rows = cur.fetchall()
+    return [{"role": r[0], "content": r[1]} for r in rows]

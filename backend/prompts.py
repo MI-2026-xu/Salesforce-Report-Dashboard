@@ -7,7 +7,7 @@ The system prompt is what teaches Claude to:
   - Ask for clarification when ambiguous
   - Follow all safety rules without questioning
 
-This file is imported by agent.py and agent_gemini.py.
+This file is imported by agent.py.
 """
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
